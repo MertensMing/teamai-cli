@@ -1,12 +1,7 @@
 import path from 'node:path';
 import YAML from 'yaml';
-import {
-  autoDetectInit,
-  saveLocalConfig,
-  saveLocalConfigForScope,
-  loadStateForScope,
-  saveStateForScope,
-} from './config.js';
+import { autoDetectInit } from './config.js';
+import { saveScopeSelection } from './scope-selection.js';
 import {
   loadProjectsManifest,
   saveProjectsManifest,
@@ -136,21 +131,9 @@ export async function projectsSet(
     return;
   }
 
-  if (localConfig.scope === 'project' && localConfig.projectRoot) {
-    await saveLocalConfigForScope(updatedConfig, localConfig.scope, localConfig.projectRoot);
-  } else {
-    await saveLocalConfig(updatedConfig);
-  }
-
-  // Invalidate pull cache so the next pull does a full sync + cleanup of the
-  // now-inactive projects' resources.
-  try {
-    const state = await loadStateForScope(localConfig);
-    state.lastPullRev = null;
-    await saveStateForScope(state, localConfig);
-  } catch {
-    // Non-critical: a missing state file means the next pull is a full sync anyway.
-  }
+  // Saves to this scope and invalidates the pull cache so the next pull does a
+  // full sync + cleanup of the now-inactive projects' resources.
+  await saveScopeSelection(localConfig, updatedConfig);
 
   if (requested.length > 0) {
     log.success(`Active projects set to: ${requested.join(', ')}`);

@@ -34,6 +34,43 @@ type SSEClient = http.ServerResponse;
 const KB_SUMMARY_TTL_MS = 30_000;
 let kbSummaryCache: { ts: number; data: VizSummary } | null = null;
 
+const MAX_JSON_BODY_BYTES = 64 * 1024;
+
+/** True for a JSON request whose Origin and Host are this dashboard on localhost. */
+export function isLocalWrite(req: http.IncomingMessage, port: number): boolean {
+  const local = new Set([`localhost:${port}`, `127.0.0.1:${port}`]);
+  if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) return false;
+  if (!local.has(req.headers.host ?? '')) return false;
+  const origin = req.headers.origin;
+  if (origin === undefined) return true;
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === 'http:' && local.has(parsed.host);
+  } catch {
+    return false;
+  }
+}
+
+/** A request's JSON object body. Throws a 400 for anything else. */
+async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  const { DistributionRequestError } = await import('./dashboard/distribution.js');
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_JSON_BODY_BYTES) throw new DistributionRequestError(400, 'Request body too large.');
+    chunks.push(chunk as Buffer);
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw new DistributionRequestError(400, 'Request body must be JSON.');
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new DistributionRequestError(400, 'Request body must be a JSON object.');
+  return body as Record<string, unknown>;
+}
+
 /**
  * Start the dashboard HTTP server.
  * Serves: HTML UI, sessions API, and SSE stream for real-time updates.
@@ -164,6 +201,63 @@ export async function startDashboard(port?: number): Promise<void> {
   };
   const pidCheckInterval = setInterval(() => void checkPids(), DASHBOARD_PID_CHECK_INTERVAL_MS);
 
+  // Distribution (#1124): read, preview, and save a workspace's roles and
+  // projects. The workspace's config is read fresh, not from the TTL cache,
+  // so a save checks its revision against what is on disk and the next read
+  // shows the saved selection.
+  const handleDistribution = async (req: http.IncomingMessage, res: http.ServerResponse, pathname: string, scopeId: string | null) => {
+    const json = (status: number, body: unknown) => {
+      res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(body));
+    };
+    const route = pathname.slice('/api/distribution'.length);
+    const writeRoutes = ['/preview', '/roles', '/projects'];
+    if (route === '' ? req.method !== 'GET' : !writeRoutes.includes(route) || req.method !== 'POST') {
+      json(route === '' || writeRoutes.includes(route) ? 405 : 404, { error: 'Not supported.' });
+      return;
+    }
+    // The server answers every origin for reads (CORS *). A write must come from
+    // the dashboard page itself: a JSON body forces a preflight this server never
+    // grants, and a foreign Origin (or a rebound Host) is refused outright.
+    if (route !== '' && !isLocalWrite(req, serverPort)) {
+      json(403, { error: 'Write requests must come from the local dashboard.' });
+      return;
+    }
+    workspacesCache = null;
+    const workspace = (await getWorkspaces(await readEvents(eventsPath))).find(w => w.id === scopeId);
+    if (!workspace?.config) {
+      if (route === '') json(200, { configured: false });
+      else json(400, { error: 'Select a workspace with a teamai config.' });
+      return;
+    }
+    try {
+      const distribution = await import('./dashboard/distribution.js');
+      if (route === '') {
+        json(200, await distribution.readDistribution(workspace.config));
+        return;
+      }
+      const body = await readJsonBody(req);
+      if (route === '/preview') {
+        json(200, await distribution.previewDistribution(workspace.config, body));
+        return;
+      }
+      if (route === '/roles') await distribution.saveRoles(workspace.config, body);
+      else await distribution.saveProjects(workspace.config, body);
+      // The cached workspace still holds the old selection; re-read it.
+      workspacesCache = null;
+      const saved = (await getWorkspaces(await readEvents(eventsPath))).find(w => w.id === scopeId);
+      json(200, saved?.config ? await distribution.readDistribution(saved.config) : { configured: false });
+    } catch (e) {
+      const { DistributionRequestError } = await import('./dashboard/distribution.js');
+      if (e instanceof DistributionRequestError) {
+        json(e.status, { error: e.message });
+        return;
+      }
+      log.debug(`dashboard: ${pathname} failed: ${(e as Error).message}`);
+      json(500, { error: 'Failed to update distribution.' });
+    }
+  };
+
   const handleRequest = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const url = new URL(req.url ?? '/', `http://localhost:${serverPort}`);
 
@@ -253,6 +347,11 @@ export async function startDashboard(port?: number): Promise<void> {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Failed to load rules.' }));
       }
+      return;
+    }
+
+    if (url.pathname === '/api/distribution' || url.pathname.startsWith('/api/distribution/')) {
+      await handleDistribution(req, res, url.pathname, scopeId);
       return;
     }
 
