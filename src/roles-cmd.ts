@@ -1,6 +1,7 @@
 import path from 'node:path';
 import YAML from 'yaml';
-import { autoDetectInit, saveLocalConfig, saveLocalConfigForScope, loadStateForScope, saveStateForScope } from './config.js';
+import { autoDetectInit } from './config.js';
+import { saveScopeSelection } from './scope-selection.js';
 import { loadRolesManifest, saveRolesManifest, findRole, listRoleIds } from './roles.js';
 import type { RolesManifest, TeamRole } from './roles.js';
 import { pathExists } from './utils/fs.js';
@@ -228,20 +229,8 @@ export async function rolesSet(
         resourceProfileVersion: manifest.version,
     };
 
-    if (localConfig.scope === 'project' && localConfig.projectRoot) {
-        await saveLocalConfigForScope(updatedConfig, localConfig.scope, localConfig.projectRoot);
-    } else {
-        await saveLocalConfig(updatedConfig);
-    }
-
-    // Invalidate pull cache so next pull does full sync with cleanup
-    try {
-        const state = await loadStateForScope(localConfig);
-        state.lastPullRev = null;
-        await saveStateForScope(state, localConfig);
-    } catch {
-        // Non-critical: if state doesn't exist yet, next pull will do full sync anyway
-    }
+    // Saves to this scope and invalidates the pull cache so the next pull does a full sync with cleanup.
+    await saveScopeSelection(localConfig, updatedConfig);
 
     log.success(`Primary role set to: ${primaryRole}`);
     if (additionalRoles.length > 0) {
