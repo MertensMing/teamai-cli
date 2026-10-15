@@ -15,6 +15,7 @@ import { getDashboardHtml } from './dashboard-html.js';
 import { getUserHome } from './utils/home.js';
 import type { VizSummary } from './viz.js';
 import { aggregateDailySessions, computeDailyStatsDelta, summarizeTrendWindow, summarizeSessionCosts } from './session-trends.js';
+import { HttpError, isLocalWrite, readJsonBody } from './dashboard/http.js';
 
 // ─── Dashboard server architecture ──────────────────────
 //
@@ -33,43 +34,6 @@ type SSEClient = http.ServerResponse;
 
 const KB_SUMMARY_TTL_MS = 30_000;
 let kbSummaryCache: { ts: number; data: VizSummary } | null = null;
-
-const MAX_JSON_BODY_BYTES = 64 * 1024;
-
-/** True for a JSON request whose Origin and Host are this dashboard on localhost. */
-export function isLocalWrite(req: http.IncomingMessage, port: number): boolean {
-  const local = new Set([`localhost:${port}`, `127.0.0.1:${port}`]);
-  if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) return false;
-  if (!local.has(req.headers.host ?? '')) return false;
-  const origin = req.headers.origin;
-  if (origin === undefined) return true;
-  try {
-    const parsed = new URL(origin);
-    return parsed.protocol === 'http:' && local.has(parsed.host);
-  } catch {
-    return false;
-  }
-}
-
-/** A request's JSON object body. Throws a 400 for anything else. */
-async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
-  const { DistributionRequestError } = await import('./dashboard/distribution.js');
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += (chunk as Buffer).length;
-    if (size > MAX_JSON_BODY_BYTES) throw new DistributionRequestError(400, 'Request body too large.');
-    chunks.push(chunk as Buffer);
-  }
-  let body: unknown;
-  try {
-    body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-  } catch {
-    throw new DistributionRequestError(400, 'Request body must be JSON.');
-  }
-  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new DistributionRequestError(400, 'Request body must be a JSON object.');
-  return body as Record<string, unknown>;
-}
 
 /**
  * Start the dashboard HTTP server.
@@ -222,9 +186,6 @@ export async function startDashboard(port?: number): Promise<void> {
       json(route === '' || writeRoutes.includes(route) ? 405 : 404, { error: 'Not supported.' });
       return;
     }
-    // The server answers every origin for reads (CORS *). A write must come from
-    // the dashboard page itself: a JSON body forces a preflight this server never
-    // grants, and a foreign Origin (or a rebound Host) is refused outright.
     if (route !== '' && !isLocalWrite(req, serverPort)) {
       json(403, { error: 'Write requests must come from the local dashboard.' });
       return;
@@ -239,13 +200,13 @@ export async function startDashboard(port?: number): Promise<void> {
       const body = await readJsonBody(req);
       if (route === '/preview') {
         const config = await freshConfig(scopeId);
-        if (!config) throw new distribution.DistributionRequestError(400, 'Select a workspace with a teamai config.');
+        if (!config) throw new HttpError(400, 'Select a workspace with a teamai config.');
         json(200, await distribution.previewDistribution(config, body));
         return;
       }
       const save = async () => {
         const config = await freshConfig(scopeId);
-        if (!config) throw new distribution.DistributionRequestError(400, 'Select a workspace with a teamai config.');
+        if (!config) throw new HttpError(400, 'Select a workspace with a teamai config.');
         if (route === '/roles') await distribution.saveRoles(config, body);
         else await distribution.saveProjects(config, body);
         const saved = await freshConfig(scopeId);
@@ -255,7 +216,7 @@ export async function startDashboard(port?: number): Promise<void> {
       distributionWrites = result.catch(() => undefined);
       json(200, await result);
     } catch (e) {
-      if (e instanceof distribution.DistributionRequestError) {
+      if (e instanceof HttpError) {
         json(e.status, { error: e.message });
         return;
       }

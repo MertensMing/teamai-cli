@@ -2,17 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fse from 'fs-extra';
 import os from 'node:os';
 import path from 'node:path';
-import type http from 'node:http';
 import YAML from 'yaml';
 
 import {
-  DistributionRequestError,
   previewDistribution,
   readDistribution,
   saveProjects,
   saveRoles,
 } from '../dashboard/distribution.js';
-import { isLocalWrite } from '../dashboard.js';
+import { HttpError } from '../dashboard/http.js';
 import type { LocalConfig } from '../types.js';
 
 /**
@@ -52,8 +50,8 @@ describe('dashboard distribution', () => {
 
   async function rejection(promise: Promise<unknown>): Promise<{ status: number; message: string }> {
     const error = await promise.then(() => null, (e: unknown) => e);
-    expect(error).toBeInstanceOf(DistributionRequestError);
-    const { status, message } = error as DistributionRequestError;
+    expect(error).toBeInstanceOf(HttpError);
+    const { status, message } = error as HttpError;
     return { status, message };
   }
 
@@ -213,21 +211,5 @@ describe('dashboard distribution', () => {
 
     expect((await rejection(saveRoles(config, { revision: stale, primaryRole: 'frontend' }))).status).toBe(409);
     expect(await fse.pathExists(path.join(homeDir, '.teamai', 'config.yaml'))).toBe(false);
-  });
-});
-
-describe('isLocalWrite', () => {
-  const request = (headers: Record<string, string>) => ({ headers } as unknown as http.IncomingMessage);
-  const json = { 'content-type': 'application/json', host: 'localhost:3721' };
-
-  it('accepts a JSON request from the dashboard page', () => {
-    expect(isLocalWrite(request({ ...json, origin: 'http://localhost:3721' }), 3721)).toBe(true);
-    expect(isLocalWrite(request(json), 3721)).toBe(true);
-  });
-
-  it('refuses a foreign origin, a rebound host, and a non-JSON body', () => {
-    expect(isLocalWrite(request({ ...json, origin: 'https://evil.example' }), 3721)).toBe(false);
-    expect(isLocalWrite(request({ ...json, host: 'evil.example:3721' }), 3721)).toBe(false);
-    expect(isLocalWrite(request({ host: 'localhost:3721', 'content-type': 'text/plain' }), 3721)).toBe(false);
   });
 });
