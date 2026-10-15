@@ -54,8 +54,15 @@ describe('dashboard distribution routes (offline)', () => {
     ] }));
     await write('manifest/projects.yaml', YAML.stringify({ version: 1, projects: [{ id: 'pay', resources: { skills: ['payment'] } }] }));
 
-    // No user config yet: the user workspace is unconfigured.
     const base = await startDashboard(home);
+
+    // Every write, on any route, must come from the dashboard page; a preflight is refused too.
+    const foreign = { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' }, body: '{}' };
+    expect((await fetch(`${base}/api/distribution/roles?workspace=user`, foreign)).status).toBe(403);
+    expect((await fetch(`${base}/api/any-later-write-route`, foreign)).status).toBe(403);
+    expect((await fetch(`${base}/api/distribution/roles?workspace=user`, { method: 'OPTIONS', headers: { Origin: 'https://evil.example' } })).status).toBe(403);
+
+    // No user config yet: the user workspace is unconfigured.
     expect(await (await fetch(`${base}/api/distribution?workspace=user`)).json()).toEqual({ configured: false });
     expect((await post(`${base}/api/distribution/roles?workspace=user`, { revision: 'x', primaryRole: 'backend' })).status).toBe(400);
 

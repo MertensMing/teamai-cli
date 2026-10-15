@@ -186,10 +186,6 @@ export async function startDashboard(port?: number): Promise<void> {
       json(route === '' || writeRoutes.includes(route) ? 405 : 404, { error: 'Not supported.' });
       return;
     }
-    if (route !== '' && !isLocalWrite(req, serverPort)) {
-      json(403, { error: 'Write requests must come from the local dashboard.' });
-      return;
-    }
     const distribution = await import('./dashboard/distribution.js');
     try {
       if (route === '') {
@@ -230,6 +226,16 @@ export async function startDashboard(port?: number): Promise<void> {
 
     // CORS headers for local development
     res.setHeader('Access-Control-Allow-Origin', '*');
+
+    // Any origin may read (CORS *), so every other method is a write and must
+    // come from this dashboard's own page, whichever route it is for (#1124).
+    // A browser's preflight (OPTIONS) is refused here too, so a cross-site
+    // write is never sent.
+    if (req.method !== 'GET' && req.method !== 'HEAD' && !isLocalWrite(req, serverPort)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Write requests must come from the local dashboard.' }));
+      return;
+    }
 
     if (url.pathname === '/' || url.pathname === '/index.html') {
       // Serve dashboard HTML
