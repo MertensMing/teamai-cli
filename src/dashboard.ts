@@ -202,9 +202,15 @@ export async function startDashboard(port?: number): Promise<void> {
   const pidCheckInterval = setInterval(() => void checkPids(), DASHBOARD_PID_CHECK_INTERVAL_MS);
 
   // Distribution (#1124): read, preview, and save a workspace's roles and
-  // projects. The workspace's config is read fresh, not from the TTL cache,
-  // so a save checks its revision against what is on disk and the next read
-  // shows the saved selection.
+  // projects. The workspace's config is read fresh, not from the TTL cache.
+  // Saves run one at a time, each reading the config, checking its revision,
+  // and writing it in turn, so two saves cannot both pass the check against
+  // one old config and the second overwrite the first.
+  let distributionWrites: Promise<unknown> = Promise.resolve();
+  const freshConfig = async (scopeId: string | null) => {
+    workspacesCache = null;
+    return (await getWorkspaces(await readEvents(eventsPath))).find(w => w.id === scopeId)?.config ?? null;
+  };
   const handleDistribution = async (req: http.IncomingMessage, res: http.ServerResponse, pathname: string, scopeId: string | null) => {
     const json = (status: number, body: unknown) => {
       res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -223,33 +229,33 @@ export async function startDashboard(port?: number): Promise<void> {
       json(403, { error: 'Write requests must come from the local dashboard.' });
       return;
     }
-    workspacesCache = null;
-    const workspace = (await getWorkspaces(await readEvents(eventsPath))).find(w => w.id === scopeId);
-    if (!workspace?.config) {
-      if (route === '') json(200, { configured: false });
-      else json(400, { error: 'Select a workspace with a teamai config.' });
-      return;
-    }
+    const distribution = await import('./dashboard/distribution.js');
     try {
-      const distribution = await import('./dashboard/distribution.js');
       if (route === '') {
-        json(200, await distribution.readDistribution(workspace.config));
+        const config = await freshConfig(scopeId);
+        json(200, config ? await distribution.readDistribution(config) : { configured: false });
         return;
       }
       const body = await readJsonBody(req);
       if (route === '/preview') {
-        json(200, await distribution.previewDistribution(workspace.config, body));
+        const config = await freshConfig(scopeId);
+        if (!config) throw new distribution.DistributionRequestError(400, 'Select a workspace with a teamai config.');
+        json(200, await distribution.previewDistribution(config, body));
         return;
       }
-      if (route === '/roles') await distribution.saveRoles(workspace.config, body);
-      else await distribution.saveProjects(workspace.config, body);
-      // The cached workspace still holds the old selection; re-read it.
-      workspacesCache = null;
-      const saved = (await getWorkspaces(await readEvents(eventsPath))).find(w => w.id === scopeId);
-      json(200, saved?.config ? await distribution.readDistribution(saved.config) : { configured: false });
+      const save = async () => {
+        const config = await freshConfig(scopeId);
+        if (!config) throw new distribution.DistributionRequestError(400, 'Select a workspace with a teamai config.');
+        if (route === '/roles') await distribution.saveRoles(config, body);
+        else await distribution.saveProjects(config, body);
+        const saved = await freshConfig(scopeId);
+        return saved ? distribution.readDistribution(saved) : { configured: false };
+      };
+      const result = distributionWrites.then(save, save);
+      distributionWrites = result.catch(() => undefined);
+      json(200, await result);
     } catch (e) {
-      const { DistributionRequestError } = await import('./dashboard/distribution.js');
-      if (e instanceof DistributionRequestError) {
+      if (e instanceof distribution.DistributionRequestError) {
         json(e.status, { error: e.message });
         return;
       }

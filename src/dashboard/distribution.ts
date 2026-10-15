@@ -13,6 +13,7 @@ import { loadProjectsManifest, type ProjectsManifest } from '../projects.js';
 import { buildRolePullContext, describeDeliveryConflict, resolveDesiredRules, resolveDesiredSkills } from '../resources/desired.js';
 import { readWorkspaceChildren } from '../workspace-children.js';
 import { saveScopeSelection } from '../scope-selection.js';
+import { log } from '../utils/logger.js';
 import type { LocalConfig } from '../types.js';
 
 /** A request the dashboard must answer with a client error, not a 500. */
@@ -30,6 +31,19 @@ export interface DistributionSelection {
 }
 
 type ManifestRead<T> = { state: 'ok'; manifest: T } | { state: 'missing' } | { state: 'invalid'; error: string };
+
+/**
+ * What an API answer says about a manifest that cannot be read. The parser's
+ * own message quotes the file around the error and may name absolute paths,
+ * and the read routes answer any origin, so it goes to the debug log only.
+ */
+function invalidManifest(kind: 'roles' | 'projects', error: unknown): { state: 'invalid'; error: string } {
+  log.debug(`dashboard: manifest/${kind}.yaml: ${(error as Error).message}`);
+  return { state: 'invalid', error: `manifest/${kind}.yaml cannot be read or parsed. Run \`teamai ${kind} list\` for details.` };
+}
+
+/** The same for a resolution that fails (an invalid manifest, a namespace clash). */
+const UNRESOLVED = 'Cannot resolve what pull delivers for this workspace. Run `teamai pull` for details.';
 
 /** The namespace types the page shows: the four a role or project names a directory for. */
 const NAMESPACE_TYPES = ['skills', 'knowledge', 'agents', 'learnings'] as const;
@@ -58,7 +72,7 @@ async function readRoles(repoPath: string): Promise<ManifestRead<RolesManifest>>
     return { state: 'ok', manifest: await loadRolesManifest(repoPath) };
   } catch (error) {
     if (error instanceof RolesManifestNotFoundError) return { state: 'missing' };
-    return { state: 'invalid', error: (error as Error).message };
+    return invalidManifest('roles', error);
   }
 }
 
@@ -67,7 +81,7 @@ async function readProjects(repoPath: string): Promise<ManifestRead<ProjectsMani
     const manifest = await loadProjectsManifest(repoPath);
     return manifest ? { state: 'ok', manifest } : { state: 'missing' };
   } catch (error) {
-    return { state: 'invalid', error: (error as Error).message };
+    return invalidManifest('projects', error);
   }
 }
 
@@ -75,44 +89,77 @@ function pickNamespaces(resources: Partial<Record<NamespaceType, string[]>>): Re
   return Object.fromEntries(NAMESPACE_TYPES.map((type) => [type, [...(resources[type] ?? [])]])) as Record<NamespaceType, string[]>;
 }
 
-/** What `pull` would deliver to this config (its children included), by name. */
+/** What `pull` would deliver to a config (with its children attached), by name. */
 interface Effective {
   /** Null when no role or project filters the scope, so every namespace is delivered. */
   namespaces: Record<NamespaceType, string[]> | null;
   skills: string[];
+  /** The namespaces the delivered skills sit in. */
+  skillNamespaces: string[];
   rules: string[];
-  /** Set when two skills of one name would be delivered: pull skips skills until it is fixed. */
+  /**
+   * Skills a workspace holds back because two members deliver different copies
+   * of one name (#913). Pull keeps whatever copy is installed: they neither
+   * enter nor leave.
+   */
+  heldSkills: string[];
+  /** Set when two skills of one name would be delivered: pull leaves skills as installed until it is fixed. */
   skillConflict?: string;
 }
 
-async function effectiveOf(ownConfig: LocalConfig): Promise<Effective> {
-  // What pull delivers to a workspace includes its children's selections (#913).
-  const config = await readWorkspaceChildren(ownConfig);
+/**
+ * Every namespace an unfiltered scope receives: each one a role or project
+ * declares, and each one the delivered skills and rules sit in. Comparing a
+ * filtered side against this, not against nothing, is what makes a switch
+ * from unfiltered delivery show the namespaces that leave.
+ */
+function everyNamespace(roles: RolesManifest | null, projects: ProjectsManifest | null, effective: Effective): Record<NamespaceType, string[]> {
+  const declared = [...(roles?.roles ?? []).map((role) => role.resources), ...(projects?.projects ?? []).map((project) => project.resources)];
+  const seen = (type: NamespaceType, extra: string[]) =>
+    [...new Set([...declared.flatMap((resources) => (resources as Partial<Record<NamespaceType, string[]>>)[type] ?? []), ...extra])].sort();
+  const prefixes = (names: string[]) => names.flatMap((name) => (name.includes('/') ? [name.split('/')[0]] : []));
+  return {
+    skills: seen('skills', effective.skillNamespaces),
+    knowledge: seen('knowledge', prefixes(effective.rules)),
+    agents: seen('agents', []),
+    learnings: seen('learnings', []),
+  };
+}
+
+async function effectiveOf(config: LocalConfig): Promise<Effective> {
   const teamConfig = await loadTeamConfig(config.repo.localPath);
-  if (!teamConfig) return { namespaces: null, skills: [], rules: [] };
+  if (!teamConfig) return { namespaces: null, skills: [], skillNamespaces: [], rules: [], heldSkills: [] };
   const roleContext = await buildRolePullContext(config);
   const skills = await resolveDesiredSkills(teamConfig, config, roleContext);
   const rules = await resolveDesiredRules(teamConfig, config, roleContext);
   return {
     namespaces: roleContext ? pickNamespaces(roleContext.activeNamespaces as ResourceNamespaces) : null,
     skills: skills.kind === 'resolved' ? skills.items.map((item) => item.name).sort() : [],
+    skillNamespaces: skills.kind === 'resolved' ? [...new Set(skills.items.flatMap((item) => (item.namespace ? [item.namespace] : [])))].sort() : [],
     rules: rules.items.map((item) => item.name).sort(),
+    heldSkills: skills.kind === 'resolved' ? [...skills.held].sort() : [],
     ...(skills.kind === 'conflict' ? { skillConflict: describeDeliveryConflict(skills) } : {}),
   };
+}
+
+/** The resolution, or the safe message the API gives when it fails. */
+async function tryEffective(config: LocalConfig): Promise<Effective | { error: string }> {
+  try {
+    return await effectiveOf(config);
+  } catch (error) {
+    log.debug(`dashboard: distribution resolution failed: ${(error as Error).message}`);
+    return { error: UNRESOLVED };
+  }
 }
 
 /** The read the Distribution page renders for one workspace. */
 export async function readDistribution(ownConfig: LocalConfig) {
   const repoPath = ownConfig.repo.localPath;
   const [roles, projects] = await Promise.all([readRoles(repoPath), readProjects(repoPath)]);
+  // What pull delivers to a workspace includes its children's selections (#913).
   const withChildren = await readWorkspaceChildren(ownConfig);
-  let effective: Effective | { error: string };
-  try {
-    effective = await effectiveOf(ownConfig);
-  } catch (error) {
-    // An invalid manifest fails pull too; say so instead of guessing what it delivers.
-    effective = { error: (error as Error).message };
-  }
+  // An invalid manifest fails pull too; say so instead of guessing what it delivers.
+  const effective = await tryEffective(withChildren);
   return {
     configured: true as const,
     revision: revisionOf(ownConfig),
@@ -219,20 +266,24 @@ export async function previewDistribution(ownConfig: LocalConfig, body: Record<s
     await checkProjects(repoPath, projects);
     candidate = { ...candidate, projects };
   }
-  let before: Effective;
-  let after: Effective;
-  try {
-    [before, after] = [await effectiveOf(ownConfig), await effectiveOf(candidate)];
-  } catch (error) {
-    throw new DistributionRequestError(409, (error as Error).message);
-  }
+  const [before, after] = [await tryEffective(await readWorkspaceChildren(ownConfig)), await tryEffective(await readWorkspaceChildren(candidate))];
+  if ('error' in before || 'error' in after) throw new DistributionRequestError(409, UNRESOLVED);
+  const manifests = [await readRoles(repoPath), await readProjects(repoPath)] as const;
+  const [roles, projects] = manifests.map((read) => (read.state === 'ok' ? read.manifest : null)) as [RolesManifest | null, ProjectsManifest | null];
+  // An unfiltered side receives every namespace, not none.
+  const namespacesOf = (side: Effective) => side.namespaces ?? everyNamespace(roles, projects, side);
+  const [fromNs, toNs] = [namespacesOf(before), namespacesOf(after)];
+  // A held skill keeps its installed copy, and a skill conflict leaves every
+  // skill as installed: neither is a skill leaving.
+  const skills = after.skillConflict
+    ? { entering: [], leaving: [] }
+    : (({ entering, leaving }) => ({ entering, leaving: leaving.filter((name) => !after.heldSkills.includes(name)) }))(diff(before.skills, after.skills));
   return {
     revision: revisionOf(ownConfig),
     selection: selectionOf(candidate),
-    // Null on a side means that side delivers every namespace.
     unfiltered: { before: before.namespaces === null, after: after.namespaces === null },
-    namespaces: Object.fromEntries(NAMESPACE_TYPES.map((type) => [type, diff(before.namespaces?.[type] ?? [], after.namespaces?.[type] ?? [])])),
-    skills: diff(before.skills, after.skills),
+    namespaces: Object.fromEntries(NAMESPACE_TYPES.map((type) => [type, diff(fromNs[type], toNs[type])])),
+    skills: { ...skills, held: after.heldSkills },
     rules: diff(before.rules, after.rules),
     ...(after.skillConflict ? { skillConflict: after.skillConflict } : {}),
   };
