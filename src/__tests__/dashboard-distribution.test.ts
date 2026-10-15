@@ -108,19 +108,59 @@ describe('dashboard distribution', () => {
     expect(read.effective).toEqual({
       namespaces: { skills: ['frontend'], knowledge: ['frontend'], agents: [], learnings: [] },
       skills: ['ui-kit'],
+      skillNamespaces: ['frontend'],
       rules: ['frontend/ui', 'style'],
+      heldSkills: [],
     });
   });
 
-  it('tells a missing manifest from an invalid one', async () => {
+  it('tells a missing manifest from an invalid one, without quoting the invalid file', async () => {
     await fse.remove(path.join(repoPath, 'manifest', 'projects.yaml'));
-    await write('manifest/roles.yaml', 'roles: [\n');
+    await write('manifest/roles.yaml', 'version: 1\ninternalNote: [INTERNAL-ONLY-MARKER\nroles: []\n');
 
     const read = await readDistribution(config);
 
     expect(read.projects).toEqual({ state: 'missing' });
     expect(read.roles).toMatchObject({ state: 'invalid' });
     expect(read.effective).toHaveProperty('error');
+    expect(JSON.stringify(read)).not.toContain('INTERNAL-ONLY-MARKER');
+    const preview = await rejection(previewDistribution(config, { primaryRole: 'frontend' }));
+    expect(preview.status).toBe(409);
+    expect(preview.message).not.toContain('INTERNAL-ONLY-MARKER');
+  });
+
+  it('counts every namespace as delivered when switching away from unfiltered delivery', async () => {
+    await fse.remove(path.join(repoPath, 'manifest', 'projects.yaml'));
+    delete config.primaryRole;
+    expect((await readDistribution(config)).effective).toMatchObject({ namespaces: null, skills: ['api-kit', 'pay-kit', 'ui-kit'] });
+
+    const preview = await previewDistribution(config, { primaryRole: 'frontend' });
+
+    expect(preview.unfiltered).toEqual({ before: true, after: false });
+    expect(preview.namespaces.skills).toEqual({ entering: [], leaving: ['backend', 'payment'] });
+    expect(preview.namespaces.knowledge).toEqual({ entering: [], leaving: ['backend'] });
+    expect(preview.skills).toMatchObject({ entering: [], leaving: ['api-kit', 'pay-kit'] });
+  });
+
+  it('reports a skill two members deliver differently as held, not leaving (#913)', async () => {
+    await write('skills/frontend/shared/SKILL.md', '# shared, frontend copy\n');
+    await write('skills/backend/shared/SKILL.md', '# shared, backend copy\n');
+    const ws = path.join(tempDir, 'ws');
+    const member = { repo: { localPath: '/nonexistent', remote: 'owner/repo' }, username: 'tester', scope: 'project' };
+    await fse.outputFile(path.join(ws, '.teamai', 'config.yaml'), YAML.stringify(member));
+    await fse.outputFile(path.join(ws, 'web', '.teamai', 'config.yaml'), YAML.stringify({ ...member, primaryRole: 'frontend' }));
+    const workspace: LocalConfig = {
+      repo: { localPath: repoPath, remote: 'owner/repo' }, username: 'tester', scope: 'project',
+      additionalRoles: [], projectRoot: ws, dataHome: path.join(ws, '.teamai'),
+    };
+
+    const read = await readDistribution(workspace);
+    expect(read.children).toEqual([{ path: 'web', primaryRole: 'frontend', additionalRoles: [], projects: [] }]);
+    expect(read.effective).toMatchObject({ skills: ['shared', 'ui-kit'], heldSkills: [] });
+
+    const preview = await previewDistribution(workspace, { primaryRole: 'backend' });
+
+    expect(preview.skills).toEqual({ entering: ['api-kit'], leaving: [], held: ['shared'] });
   });
 
   it('previews roles and projects without writing anything', async () => {
@@ -130,7 +170,7 @@ describe('dashboard distribution', () => {
 
     expect(preview.selection).toEqual({ primaryRole: 'backend', additionalRoles: [], projects: ['pay'] });
     expect(preview.namespaces.skills).toEqual({ entering: ['backend', 'payment'], leaving: ['frontend'] });
-    expect(preview.skills).toEqual({ entering: ['api-kit', 'pay-kit'], leaving: ['ui-kit'] });
+    expect(preview.skills).toEqual({ entering: ['api-kit', 'pay-kit'], leaving: ['ui-kit'], held: [] });
     expect(preview.rules).toEqual({ entering: ['backend/api'], leaving: ['frontend/ui'] });
     expect(await snapshotRepo()).toEqual(before);
     expect(await fse.pathExists(path.join(homeDir, '.teamai', 'config.yaml'))).toBe(false);
