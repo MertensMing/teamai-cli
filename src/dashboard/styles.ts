@@ -14,16 +14,17 @@ aside{background:var(--sidebar)}.brand svg g[stroke]{stroke:var(--logo)}.brand s
 
 /* Keep native selection behavior and a native fallback for older browsers. */
 @supports (appearance:base-select){
- #workspace,#workspace::picker(select){appearance:base-select}
- #workspace{display:flex;align-items:center;gap:8px;text-align:start;min-height:38px;border-radius:8px}
- #workspace selectedcontent{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
- #workspace::picker-icon{color:var(--muted);flex-shrink:0}
- #workspace:open{border-color:var(--blue)}
- #workspace::picker(select){width:max(anchor-size(width),260px);max-width:calc(100vw - 24px);max-height:min(320px,60dvh);overflow:auto;margin-block:6px;padding:5px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--text);box-shadow:0 8px 24px #0003;font:inherit}
- #workspace option{display:flex;align-items:center;gap:8px;min-height:38px;padding:9px 10px;border-radius:6px;white-space:normal;overflow-wrap:anywhere;cursor:pointer}
- #workspace option:checked{background:var(--selected);color:var(--link);font-weight:600}
- #workspace option:hover{background:var(--hover)}
- #workspace option:focus-visible{outline:2px solid var(--blue);outline-offset:-2px}
- #workspace option::checkmark{color:var(--link);flex-shrink:0}
+ select,select::picker(select){appearance:base-select}
+ select{display:flex;align-items:center;gap:8px;text-align:start;min-width:0;max-width:100%;min-height:38px;border-radius:8px}
+ select selectedcontent{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ select::picker-icon{color:var(--muted);flex-shrink:0}
+ select:open{border-color:var(--blue)}
+ select::picker(select){width:max(anchor-size(width),160px);max-width:calc(100vw - 24px);max-height:min(320px,60dvh);overflow:auto;margin-block:6px;padding:5px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--text);box-shadow:0 8px 24px #0003;font:inherit}
+ select option{display:flex;align-items:center;gap:8px;min-height:38px;padding:9px 10px;border-radius:6px;white-space:normal;overflow-wrap:anywhere;cursor:pointer}
+ select option:checked{background:var(--selected);color:var(--link);font-weight:600}
+ select option:hover{background:var(--hover)}
+ select option:focus-visible{outline:2px solid var(--blue);outline-offset:-2px}
+ select option::checkmark{color:var(--link);flex-shrink:0}
+ #workspace::picker(select){width:max(anchor-size(width),260px)}
 }
 `;
